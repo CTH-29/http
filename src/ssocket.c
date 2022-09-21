@@ -8,6 +8,9 @@
 #include <errno.h>
 #include <time.h>
 #include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 
 #define INVALID_FD -1
 #define CHECK_NULL(p, ret) \
@@ -39,8 +42,8 @@ int _socket_wait(int socket_fd, int dir, int timeout_ms);
 bool _check_addr(const char *addr);
 void _set_tcp_opts(int socket_fd);
 
-#define ssocket_write_wait(fd,tm) _socket_wait(fd,2,tm)
-#define ssocket_read_wait(fd,tm)  _socket_wait(fd,1,tm)
+#define ssocket_write_wait(fd, tm) _socket_wait(fd, 2, tm)
+#define ssocket_read_wait(fd, tm) _socket_wait(fd, 1, tm)
 
 /**
  * _socket_wait(): wait the socket ready to read or write.
@@ -125,8 +128,10 @@ void ssocket_destory(ssocket_t *sso)
     {
         if (sso->fd != INVALID_FD)
             ssocket_disconnect(sso);
-        free(sso->protocol);
-        free(sso->hostname);
+        if (sso->protocol)
+            free(sso->protocol);
+        if (sso->hostname)
+            free(sso->hostname);
         free(sso);
     }
 }
@@ -134,17 +139,17 @@ void ssocket_destory(ssocket_t *sso)
 bool ssocket_set_addr(ssocket_t *sso, const char *protocol, const char *hostname, const char *port)
 {
     CHECK_NULL(sso, false);
-    if(protocol)
+    if (protocol)
     {
         free(sso->protocol);
         sso->protocol = strdup(protocol);
     }
-    if(hostname)
+    if (hostname)
     {
         free(sso->hostname);
         sso->hostname = strdup(hostname);
     }
-    if(port)
+    if (port)
     {
         sso->port = atoi(port);
     }
@@ -167,16 +172,89 @@ bool ssocket_set_url(ssocket_t *sso, const char *url)
     substr1 += 3;
     substr2 = strstr(substr1, ":");
     substr3 = strstr(substr1, "/");
-    if (substr2 == NULL)
-        return false;
-    sso->hostname = strndup(substr1, substr2 - substr1);
-
-    if (substr3 == NULL)
-        portstr = strdup(substr2 + 1);
+    if (substr3)
+    {
+        if (substr2 && substr2 < substr3)
+        {
+            sso->hostname = strndup(substr1, substr2 - substr1);
+            substr2++;
+            portstr = strndup(substr2, substr3 - substr2);
+        }
+        else
+        {
+            sso->hostname = strndup(substr1, substr3 - substr1);
+        }
+    }
     else
-        portstr = strndup(substr2 + 1, substr3 - substr2 - 1);
-    sso->port = atoi(portstr);
-    free(portstr);
+    {
+        if (substr2)
+        {
+            sso->hostname = strndup(substr1, substr2 - substr1);
+            substr2++;
+            portstr = strdup(substr2);
+        }
+        else
+        {
+            sso->hostname = strdup(substr1);
+        }
+    }
+    if (portstr)
+    {
+        sso->port = atoi(portstr);
+        free(portstr);
+    }
+    else
+    {
+        sso->port = 0;
+    }
+    return true;
+}
+
+bool _socket_connect(int socket_fd, struct sockaddr *server, int timeout)
+{
+    int ret;
+    int flags;
+    if (socket_fd == INVALID_FD)
+    {
+        socket_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (socket_fd == INVALID_FD)
+        {
+            _ssocket_debug("ssocket create socket failed");
+            return false;
+        }
+        /* set socket to non-blocking mode */
+        flags = fcntl(socket_fd, F_GETFL, 0);
+        fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK);
+    }
+    char *dat = (char *)server;
+    for (size_t i = 0; i < sizeof(struct sockaddr); i++)
+    {
+        _ssocket_debug("%d ", dat[i]);
+    }
+    
+    //_ssocket_debug("ssocket connecting %08x:%x", ntohl((((struct sockaddr_in*)server)->sin_addr), ntohs(((struct sockaddr_in*)server)->sin_port));
+    ret = connect(socket_fd, server, sizeof(struct sockaddr));
+    if (ret == 0)
+        return true;
+    else if (errno != EINPROGRESS)
+        return false;
+
+    /*
+     * use select to check write event, if the socket is writable and no errors,
+     * then connect is complete successfully!
+     */
+    if (ssocket_write_wait(socket_fd, timeout) > 0)
+        return false;
+
+    int error = 0;
+    socklen_t length = sizeof(error);
+    if (getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &length) < 0)
+        return false;
+
+    if (error != 0)
+        return false;
+
+    fcntl(socket_fd, F_SETFL, flags);
     return true;
 }
 
@@ -195,6 +273,7 @@ bool ssocket_connect(ssocket_t *sso)
     }
     */
 
+    ssocket_dump(sso);
     if (_check_hostname(sso->hostname)) /* only consist of number and dot */
     {
         in_addr_t _addr = inet_addr(sso->hostname); /* only consider ipv4 */
@@ -205,82 +284,53 @@ bool ssocket_connect(ssocket_t *sso)
         }
         server.sin_family = AF_INET;
         server.sin_addr.s_addr = _addr;
-    }
-    else
-    {
-        struct hostent *he = gethostbyname(sso->hostname); /* only consider ipv4 */
-        if (he == NULL)
-        {
-            _ssocket_debug("ssocket can't resolve the hostname [%s]", sso->hostname);
-            return false;
-        }
-        if (he->h_addrtype != AF_INET || he->h_length != 4)
-        {
-            _ssocket_debug("ssocket only support ipv4, and [%s] is not", sso->hostname);
-            return false;
-        }
-        server.sin_family = AF_INET;
-        struct in_addr **addr_list = (struct in_addr **)he->h_addr_list;
-        server.sin_addr = *(addr_list[0]);
-    }
+        server.sin_port = htons(sso->port);
 
-    server.sin_port = htons(sso->port);
-
-    _ssocket_debug("ssocket connecting %s:%d", inet_ntoa(server.sin_addr), ntohs(server.sin_port));
-
-    if (sso->fd == INVALID_FD)
-    {
-        sso->fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (sso->fd == INVALID_FD)
-        {
-            _ssocket_debug("ssocket create socket failed");
-            return false;
-        }
-    }
-
-    /* set socket to non-blocking mode */
-    int flags = fcntl(sso->fd, F_GETFL, 0);
-    fcntl(sso->fd, F_SETFL, flags | O_NONBLOCK);
-
-    ret = connect(sso->fd, (struct sockaddr *)&server, sizeof(server));
-
-    if (ret == 0)
-        goto OK;
-    else
-        if (errno != EINPROGRESS)
+        if (_socket_connect(sso->fd, (struct sockaddr*)&server,sso->timeout_conn))
+            goto OK;
+        else
             goto FAIL;
-
-    /*
-     * use select to check write event, if the socket is writable and no errors,
-     * then connect is complete successfully!
-     */
-    if (ssocket_write_wait(sso->fd, sso->timeout_conn) > 0)
-        goto FAIL;
-
-    int error = 0;
-    socklen_t length = sizeof(error);
-    if (getsockopt(sso->fd, SOL_SOCKET, SO_ERROR, &error, &length) < 0)
-        goto FAIL;
-
-    if (error != 0)
-        goto FAIL;
-
-    _set_tcp_opts(sso->fd);
-    goto OK;
+    }
+    else
+    {
+//         ssocket_dump(sso);
+//         char _port[20];
+//         sprintf(_port,"%d",sso->port);
+// 
+//         struct addrinfo *servr_info, hints;
+//         if( getaddrinfo(sso->hostname, _port, &hints, &servr_info) )
+//         {
+//             printf("Failed to getaddrinfo for %s:%s, sleep\n", sso->hostname, _port);
+//             sleep(6);
+//         }
+//         ssocket_dump(sso);
+//         for ( ; servr_info ; servr_info = servr_info->ai_next)
+//         {
+//             if (_socket_connect(sso->fd, servr_info->ai_addr,sso->timeout_conn))
+//             {
+//                 goto OK;
+//             }
+//             else
+//             {
+//                 close(sso->fd);
+//             }
+//         }
+//         goto FAIL;
+    }
 
 FAIL:
-    _ssocket_debug("ssocket connect failed!");
-    close(sso->fd);
+    _ssocket_debug("ssocket connect failed");
+    ssocket_disconnect(sso);
     return false;
 OK:
-    _ssocket_debug("ssocket connect success!");
-    fcntl(sso->fd, F_SETFL, flags);
+    _ssocket_debug("ssocket connect success");
+    _set_tcp_opts(sso->fd);
     return true;
 }
 
 bool ssocket_disconnect(ssocket_t *sso)
 {
-    CHECK_SOCKET(sso->fd, false);
+    CHECK_NULL(sso, false);
     shutdown(sso->fd, SHUT_RDWR);
     close(sso->fd);
     sso->fd = INVALID_FD;

@@ -2,8 +2,8 @@
 
 #include "ssocket.h"
 
-static char http_sbuf[2048];
-static char http_rbuf[2048];
+static char http_sbuf[4096];
+static char http_rbuf[4096];
 
 char *_skip_whitespace(char *msg)
 {
@@ -66,38 +66,51 @@ FINE:
     return status_code;
 }
 
-int _parse_url(const char *url, char *host, char *file)
+bool _parse_url(const char *url, char *host, char *uri)
 {
     char *ptr1, *ptr2;
     int len = 0;
 
-    if ((ptr1 = strstr(url, "http://")) == NULL)
-        return -1;
+    ptr1 = strstr(url, "http://");
+    if (ptr1 == NULL)
+        return false;
     ptr1 += strlen("http://");
     if ((ptr2 = strchr(ptr1, '/')) == NULL)
-        return -1;
+        return false;
 
     strncpy(host, ptr1, ptr2 - ptr1);
-    strcpy(file, ptr2 + 1);
-    return 0;
+    strcpy(uri, ptr2 + 1);
+
+    return true;
 }
 
-char *http_request(const char *mothed, const char *url, char *version, char *headers[], const char *contents)
+char *http_request(const char *mothed, const char *url, char *version, char *headers[], const char *content)
 {
     char host[128];
-    char file[128];
+    char uri[256];
     int offfset;
 
     ssocket_t *sso = ssocket_create(2000, 1000, 1000);
+    
     ssocket_set_url(sso, url);
+
+    if(sso->port == 0 )
+        sso->port = 8080;
+
+    if( _parse_url(url, host, uri) == false)
+    {
+        printf("http url error\n");
+        goto FAIL;
+    }
+
     if (!ssocket_connect(sso))
     {
         printf("http connect failed\n");
         goto FAIL;
     }
-    _parse_url(url, host, file);
-    offfset = snprintf(http_sbuf, sizeof(http_sbuf), "%s /%s %s\r\n", mothed, file, version);
-    offfset += snprintf(http_sbuf + offfset, sizeof(http_sbuf) - offfset, "HOST: %s\r\n", host);
+
+    offfset = snprintf(http_sbuf, sizeof(http_sbuf), "%s /%s %s\r\n", mothed, uri, version);
+    offfset += snprintf(http_sbuf + offfset, sizeof(http_sbuf) - offfset, "Host: %s\r\nAccept: */*\r\n", host);
 
     for (int i = 0; headers[i]; i++)
     {
@@ -107,9 +120,9 @@ char *http_request(const char *mothed, const char *url, char *version, char *hea
 
     strcat(http_sbuf, "\r\n");
 
-    if (contents)
+    if (content)
     {
-        strcat(http_sbuf, contents);
+        strcat(http_sbuf, content);
         strcat(http_sbuf, "\r\n");
     }
 
@@ -133,12 +146,12 @@ FAIL:
     return NULL;
 }
 
-char *http_get(const char *url, bool use_http_1_1, char *headers[], const char *contents)
+char *http_get(const char *url, bool use_http_1_1, char *headers[], const char *content)
 {
-    return http_request("GET", url, use_http_1_1 ? "HTTP/1.1" : "HTTP/1.0", headers, contents);
+    return http_request("GET", url, use_http_1_1 ? "HTTP/1.1" : "HTTP/1.0", headers, content);
 }
 
-char *http_post(const char *url, bool use_http_1_1, char *headers[], const char *contents)
+char *http_post(const char *url, bool use_http_1_1, char *headers[], const char *content)
 {
-    return http_request("POST", url, use_http_1_1 ? "HTTP/1.1" : "HTTP/1.0", headers, contents);
+    return http_request("POST", url, use_http_1_1 ? "HTTP/1.1" : "HTTP/1.0", headers, content);
 }
