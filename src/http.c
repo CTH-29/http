@@ -3,7 +3,7 @@
 #include "ssocket.h"
 
 static char http_sbuf[4096];
-static char http_rbuf[4096];
+static char http_rbuf[20000];
 
 char *_skip_whitespace(char *msg)
 {
@@ -66,55 +66,69 @@ FINE:
     return status_code;
 }
 
-bool _parse_url(const char *url, char *host, char *uri)
+bool _parse_url(const char *url, char *host, char *port, char *uri)
 {
-    char *ptr1, *ptr2;
-    int len = 0;
+    char *ptr1, *ptr2, *ptr3, *ptr4;
+    int host_len = 0;
 
     ptr1 = strstr(url, "http://");
     if (ptr1 == NULL)
         return false;
     ptr1 += strlen("http://");
-    if ((ptr2 = strchr(ptr1, '/')) == NULL)
-        return false;
 
-    strncpy(host, ptr1, ptr2 - ptr1);
-    strcpy(uri, ptr2 + 1);
+    if ((ptr3 = strchr(ptr1, '/')) == NULL)
+    {
+        uri[0] = 0;
+        host_len = strlen(ptr1);
+    }
+    else
+    {
+        strcpy(uri, ptr3 + 1);
+        host_len = ptr3 - ptr1;
+    }
 
+    ptr2 = strchr(ptr1, ':');
+    if (ptr2 && ptr2 < ptr3)
+    {
+        host_len = ptr2 - ptr1;
+        strncpy(port, ptr2 + 1, ptr3 - ptr2 - 1);
+    }
+    else
+    {
+        strcpy(port, "80");
+    }
+
+    strncpy(host, ptr1, host_len);
     return true;
 }
 
 char *http_request(const char *mothed, const char *url, char *version, char *headers[], const char *content)
 {
     char host[128];
+    char port[8];
     char uri[256];
     int offfset;
 
     ssocket_t *sso = ssocket_create(2000, 1000, 1000);
-    
-    ssocket_set_url(sso, url);
 
-    if(sso->port == 0 )
-        sso->port = 8080;
-
-    if( _parse_url(url, host, uri) == false)
+    if (_parse_url(url, host, port, uri) == false)
     {
         printf("http url error\n");
         goto FAIL;
     }
 
-    if (!ssocket_connect(sso))
+    if (!ssocket_connect_hostname(sso, host, port))
     {
         printf("http connect failed\n");
         goto FAIL;
     }
 
     offfset = snprintf(http_sbuf, sizeof(http_sbuf), "%s /%s %s\r\n", mothed, uri, version);
-    offfset += snprintf(http_sbuf + offfset, sizeof(http_sbuf) - offfset, "Host: %s\r\nAccept: */*\r\n", host);
+    offfset += snprintf(http_sbuf + offfset, sizeof(http_sbuf) - offfset, "Host: %s:%s\r\nAccept: */*\r\n", host, port);
 
     for (int i = 0; headers[i]; i++)
     {
-        strcat(http_sbuf,headers[i]);
+        strcat(http_sbuf, headers[i]);
         strcat(http_sbuf, "\r\n");
     }
 

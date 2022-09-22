@@ -7,10 +7,7 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <time.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
+
 
 #define INVALID_FD -1
 #define CHECK_NULL(p, ret) \
@@ -42,8 +39,8 @@ int _socket_wait(int socket_fd, int dir, int timeout_ms);
 bool _check_addr(const char *addr);
 void _set_tcp_opts(int socket_fd);
 
-#define ssocket_write_wait(fd, tm) _socket_wait(fd, 2, tm)
-#define ssocket_read_wait(fd, tm) _socket_wait(fd, 1, tm)
+// #define _socket_write_wait(fd, tm) _socket_wait(fd, 2, tm)
+// #define _socket_read_wait(fd, tm) _socket_wait(fd, 1, tm)
 
 /**
  * _socket_wait(): wait the socket ready to read or write.
@@ -130,202 +127,146 @@ void ssocket_destory(ssocket_t *sso)
             ssocket_disconnect(sso);
         if (sso->protocol)
             free(sso->protocol);
-        if (sso->hostname)
-            free(sso->hostname);
+        if (sso->ip)
+            free(sso->ip);
         free(sso);
     }
 }
 
-bool ssocket_set_addr(ssocket_t *sso, const char *protocol, const char *hostname, const char *port)
+int _socket_connect(int domain, int type, int protocol, struct sockaddr *server, int timeout)
 {
-    CHECK_NULL(sso, false);
-    if (protocol)
-    {
-        free(sso->protocol);
-        sso->protocol = strdup(protocol);
-    }
-    if (hostname)
-    {
-        free(sso->hostname);
-        sso->hostname = strdup(hostname);
-    }
-    if (port)
-    {
-        sso->port = atoi(port);
-    }
-}
+    int socket_fd, flags, ret;
+    int error = 0;
+    socklen_t length = sizeof(error);
+    struct sockaddr_in *server_ptr;
 
-/* protocol://hostname:port[/xxx] */
-bool ssocket_set_url(ssocket_t *sso, const char *url)
-{
-    char *substr1, *substr2, *substr3, *portstr;
-    CHECK_NULL(sso, false);
-
-    free(sso->protocol);
-    free(sso->hostname);
-
-    substr1 = strstr(url, "://");
-    if (substr1 == NULL)
-        return false;
-    sso->protocol = strndup(url, substr1 - url);
-
-    substr1 += 3;
-    substr2 = strstr(substr1, ":");
-    substr3 = strstr(substr1, "/");
-    if (substr3)
-    {
-        if (substr2 && substr2 < substr3)
-        {
-            sso->hostname = strndup(substr1, substr2 - substr1);
-            substr2++;
-            portstr = strndup(substr2, substr3 - substr2);
-        }
-        else
-        {
-            sso->hostname = strndup(substr1, substr3 - substr1);
-        }
-    }
-    else
-    {
-        if (substr2)
-        {
-            sso->hostname = strndup(substr1, substr2 - substr1);
-            substr2++;
-            portstr = strdup(substr2);
-        }
-        else
-        {
-            sso->hostname = strdup(substr1);
-        }
-    }
-    if (portstr)
-    {
-        sso->port = atoi(portstr);
-        free(portstr);
-    }
-    else
-    {
-        sso->port = 0;
-    }
-    return true;
-}
-
-bool _socket_connect(int socket_fd, struct sockaddr *server, int timeout)
-{
-    int ret;
-    int flags;
+    socket_fd = socket(domain, type, protocol);
     if (socket_fd == INVALID_FD)
-    {
-        socket_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (socket_fd == INVALID_FD)
-        {
-            _ssocket_debug("ssocket create socket failed");
-            return false;
-        }
-        /* set socket to non-blocking mode */
-        flags = fcntl(socket_fd, F_GETFL, 0);
-        fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK);
-    }
-    char *dat = (char *)server;
-    for (size_t i = 0; i < sizeof(struct sockaddr); i++)
-    {
-        _ssocket_debug("%d ", dat[i]);
-    }
-    
-    //_ssocket_debug("ssocket connecting %08x:%x", ntohl((((struct sockaddr_in*)server)->sin_addr), ntohs(((struct sockaddr_in*)server)->sin_port));
-    ret = connect(socket_fd, server, sizeof(struct sockaddr));
-    if (ret == 0)
-        return true;
+        return -1;
+
+    /* set socket to non-blocking mode */
+    flags = fcntl(socket_fd, F_GETFL, 0);
+    fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK);
+
+    server_ptr = (struct sockaddr_in *)server;
+    char *addr_str = inet_ntoa(server_ptr->sin_addr);
+    _ssocket_debug("ssocket connect %s %s:%d", server_ptr->sin_family == AF_INET ? "ipv4" : "not ipv4", addr_str, ntohs(server_ptr->sin_port));
+
+    if (connect(socket_fd, server, sizeof(struct sockaddr)) == 0)
+        return socket_fd;
     else if (errno != EINPROGRESS)
-        return false;
+        goto close_and_exit;
 
     /*
      * use select to check write event, if the socket is writable and no errors,
      * then connect is complete successfully!
      */
-    if (ssocket_write_wait(socket_fd, timeout) > 0)
-        return false;
+    if (_socket_wait(socket_fd, 2, timeout) != 0)
+    {
+        _ssocket_debug("ssocket connect timeout");
+        goto close_and_exit;
+    }
 
-    int error = 0;
-    socklen_t length = sizeof(error);
     if (getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &length) < 0)
-        return false;
+        goto close_and_exit;
 
     if (error != 0)
-        return false;
+        goto close_and_exit;
 
     fcntl(socket_fd, F_SETFL, flags);
+    _set_tcp_opts(socket_fd);
+    return socket_fd;
+
+close_and_exit:
+    close(socket_fd);
+    return -1;
+}
+
+bool ssocket_connect_hostname(ssocket_t *sso, const char *hostname, const char *port)
+{
+    unsigned short port_num;
+    struct hostent *hosts;
+    struct sockaddr_in host;
+    port_num = atoi(port);
+
+    CHECK_NULL(sso, false);
+    CHECK_NULL(hostname, false);
+    CHECK_NULL(port, false);
+
+    if (_check_hostname(hostname)) /* only consist of number and dot */
+        return ssocket_connect_ip(sso, hostname, port_num);
+    hosts = gethostbyname(hostname);
+    if (hosts == NULL)
+    {
+        _ssocket_debug("ssocket get host failed for %s", hostname);
+        return false;
+    }
+
+    // printf("hosts->h_name = %s\n", hosts->h_name);
+    // for (char **ptr = hosts->h_aliases; *ptr; ptr++)
+    //     printf("hosts->h_aliases = %s\n", *ptr);
+    // printf("hosts->h_addrtype = %d\n", hosts->h_addrtype);
+    // printf("hosts->h_length = %d\n", hosts->h_length);
+    // for (char **ptr = hosts->h_addr_list; *ptr; ptr++)
+    //     printf("hosts->h_addr_list = %s\n", inet_ntoa(*((struct in_addr* )(*ptr))));
+
+
+    if(hosts->h_addrtype != AF_INET || hosts->h_length != 4)
+        _ssocket_debug("ssocket host not have ipv4 addr");
+
+    for (char **ptr = hosts->h_addr_list; *ptr; ptr++)
+    {
+        host.sin_family = AF_INET;
+        host.sin_addr.s_addr = (*(in_addr_t *)(*ptr));
+        host.sin_port = htons(port_num);
+        sso->fd = _socket_connect(AF_INET, SOCK_STREAM, IPPROTO_TCP, (struct sockaddr *)&host, sso->timeout_conn);
+        if (sso->fd != INVALID_FD)
+            goto OK;
+    }
+
+    _ssocket_debug("ssocket connect failed");
+    return false;
+
+OK:
+    _ssocket_debug("ssocket connect success");
+    sso->protocol = strdup("tcp");
+    sso->ip = strdup(inet_ntoa(host.sin_addr));
+    sso->port = port_num;
     return true;
 }
 
-bool ssocket_connect(ssocket_t *sso)
+bool ssocket_connect_ip(ssocket_t *sso, const char *ip, unsigned short port)
 {
-    int ret;
-    struct sockaddr_in server;
-
+    struct sockaddr_in host;
     CHECK_NULL(sso, false);
+    CHECK_NULL(ip, false);
 
-    /*
-    if (!(strstr(sso->protocol, "TCP") || strstr(sso->protocol, "tcp")))
+    in_addr_t _addr = inet_addr(ip); /* only consider ipv4 */
+    if (_addr == INADDR_NONE)
     {
-        _ssocket_debug("only support tcp connection");
+        _ssocket_debug("ssocket invalid ip %s", ip);
         return false;
     }
-    */
 
-    ssocket_dump(sso);
-    if (_check_hostname(sso->hostname)) /* only consist of number and dot */
+    host.sin_family = AF_INET;
+    host.sin_addr.s_addr = _addr;
+    host.sin_port = htons(port);
+
+    sso->fd = _socket_connect(AF_INET, SOCK_STREAM, IPPROTO_TCP, (struct sockaddr *)&host, sso->timeout_conn);
+
+    if (sso->fd != INVALID_FD)
     {
-        in_addr_t _addr = inet_addr(sso->hostname); /* only consider ipv4 */
-        if (_addr == INADDR_NONE)
-        {
-            _ssocket_debug("ssocket can't resolve the hostname [%s]", sso->hostname);
-            return false;
-        }
-        server.sin_family = AF_INET;
-        server.sin_addr.s_addr = _addr;
-        server.sin_port = htons(sso->port);
-
-        if (_socket_connect(sso->fd, (struct sockaddr*)&server,sso->timeout_conn))
-            goto OK;
-        else
-            goto FAIL;
+        _ssocket_debug("ssocket connect success");
+        sso->protocol = strdup("tcp");
+        sso->ip = strdup(inet_ntoa(host.sin_addr));
+        sso->port = port;
+        return true;
     }
     else
     {
-//         ssocket_dump(sso);
-//         char _port[20];
-//         sprintf(_port,"%d",sso->port);
-// 
-//         struct addrinfo *servr_info, hints;
-//         if( getaddrinfo(sso->hostname, _port, &hints, &servr_info) )
-//         {
-//             printf("Failed to getaddrinfo for %s:%s, sleep\n", sso->hostname, _port);
-//             sleep(6);
-//         }
-//         ssocket_dump(sso);
-//         for ( ; servr_info ; servr_info = servr_info->ai_next)
-//         {
-//             if (_socket_connect(sso->fd, servr_info->ai_addr,sso->timeout_conn))
-//             {
-//                 goto OK;
-//             }
-//             else
-//             {
-//                 close(sso->fd);
-//             }
-//         }
-//         goto FAIL;
+        _ssocket_debug("ssocket connect failed");
+        return false;
     }
-
-FAIL:
-    _ssocket_debug("ssocket connect failed");
-    ssocket_disconnect(sso);
-    return false;
-OK:
-    _ssocket_debug("ssocket connect success");
-    _set_tcp_opts(sso->fd);
-    return true;
 }
 
 bool ssocket_disconnect(ssocket_t *sso)
@@ -347,7 +288,7 @@ bool ssocket_send(ssocket_t *sso, const char *sbuf, int sbuf_len)
     while (sbuf_len > 0)
     {
         int n;
-        if (ssocket_write_wait(sso->fd, sso->timeout_send) > 0)
+        if (_socket_wait(sso->fd, 2, sso->timeout_send) > 0)
             return false;
         n = send(sso->fd, sbuf + send_offset, sbuf_len, MSG_NOSIGNAL);
         if (n < 0)
@@ -368,7 +309,7 @@ int ssocket_recv(ssocket_t *sso, char *rbuf, int rbuf_len)
     CHECK_SOCKET(sso->fd, 0);
     CHECK_NULL(rbuf, 0);
 
-    if (ssocket_read_wait(sso->fd, sso->timeout_recv) == 0)
+    if (_socket_wait(sso->fd, 1, sso->timeout_recv) == 0)
     {
         ret = recv(sso->fd, rbuf, rbuf_len, 0);
         if (ret > 0)
@@ -398,7 +339,7 @@ void ssocket_dump(ssocket_t *sso)
     printf("ssocket_t dump:\n");
     printf("\tfd = %d\n", sso->fd);
     printf("\tprotocol = %s\n", sso->protocol);
-    printf("\thostname = %s\n", sso->hostname);
+    printf("\tip = %s\n", sso->ip);
     printf("\tport = %d\n", sso->port);
     printf("\ttimeout = %d,%d,%d\n", sso->timeout_conn, sso->timeout_recv, sso->timeout_send);
 }
