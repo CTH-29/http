@@ -11,7 +11,7 @@ int main(int argc, char *argv[])
     char *headers;
     char *content;
 
-    char *recv_data = http_get("http://172.28.83.246:8848/", true, header_lines, NULL);
+    char *recv_data = http_get("http://mes.bitmain.com:51611/api/Default/GetMes", true, header_lines, NULL);
     if (recv_data)
     {
         int status_code = http_parse_response(recv_data, &version, &status_msg, &headers, &content);

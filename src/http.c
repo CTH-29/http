@@ -2,8 +2,8 @@
 
 #include "ssocket.h"
 
-static char http_sbuf[4096];
-static char http_rbuf[20000];
+static char http_sbuf[16*1024];
+static char http_rbuf[32*1024];
 
 char *_skip_whitespace(char *msg)
 {
@@ -152,7 +152,7 @@ char *http_request(const char *mothed, const char *url, char *version, char *hea
         goto FAIL;
     }
 
-    ssocket_recv(sso, http_rbuf, 2048);
+    ssocket_recv(sso, http_rbuf, sizeof(http_rbuf));
     printf("http request finish\n");
     return http_rbuf;
 FAIL:
